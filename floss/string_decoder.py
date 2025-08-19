@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from typing import Set, List
+from typing import Set, List, Optional
 from dataclasses import dataclass
 
 import tqdm
@@ -172,8 +172,9 @@ def decode_strings(
                 if should_shortcut(fva, n, n_calls, len(seen)):
                     break
 
-                for delta in emulate_decoding_routine(vw, function_index, fva, ctx, max_insn_count):
-                    for delta_bytes in extract_delta_bytes(delta, ctx.decoded_at_va, fva):
+                arguments = []  # type: List[int]
+                for delta in emulate_decoding_routine(vw, function_index, fva, ctx, max_insn_count, arguments):
+                    for delta_bytes in extract_delta_bytes(delta, ctx.decoded_at_va, arguments, fva):
                         for s in floss.utils.extract_strings(delta_bytes.bytes, min_length, seen):
                             ds = DecodedString(
                                 address=delta_bytes.address + s.offset,
@@ -182,6 +183,7 @@ def decode_strings(
                                 encoding=s.encoding,
                                 decoded_at=delta_bytes.decoded_at,
                                 decoding_routine=delta_bytes.decoding_routine,
+                                decoded_position=delta_bytes.position,
                             )
                             floss.results.log_result(ds, verbosity)
                             seen.add(ds.string)
@@ -189,7 +191,9 @@ def decode_strings(
         return decoded_strings
 
 
-def emulate_decoding_routine(vw, function_index, function: int, context, max_instruction_count: int) -> List[Delta]:
+def emulate_decoding_routine(
+    vw, function_index, function: int, context, max_instruction_count: int, arguments: Optional[List[int]] = None
+) -> List[Delta]:
     """
     Emulate a function with a given context and extract the CPU and
      memory contexts at interesting points during emulation.
@@ -209,6 +213,7 @@ def emulate_decoding_routine(vw, function_index, function: int, context, max_ins
     :param context: The initial state of the CPU and memory
       prior to the function being called.
     :param max_instruction_count: The maximum number of instructions to emulate per function.
+    :param arguments: A list of arguments after the decoding function runs
     :rtype: Sequence[decoding_manager.Delta]
     """
     emu = floss.utils.make_emulator(vw)
@@ -222,6 +227,29 @@ def emulate_decoding_routine(vw, function_index, function: int, context, max_ins
     deltas = floss.decoding_manager.emulate_function(
         emu, function_index, function, context.return_address, max_instruction_count
     )
+
+    # get the number of arguments to the decoding function
+    n_args = len(vw.getFunctionArgs(function))
+    psize = floss.utils.getPointerSize(vw)
+
+    # list up to n_args registers that hold the arguments
+    # the return value is captured, as well
+    if psize == 8:
+        registers = ["rax", "rcx", "rdx", "r8", "r9"][: (n_args + 1)]
+        n_args -= len(registers) - 1
+    else:
+        registers = ["eax"]
+
+    if arguments is None:
+        arguments = []
+
+    # collect the register values
+    arguments.extend([emu.getRegisterByName(reg) for reg in registers])
+
+    # collect the remaining arguments from the stack
+    for num in range(n_args):
+        arguments.append(floss.utils.get_stack_value(emu, num * psize))
+
     return deltas
 
 
@@ -232,9 +260,12 @@ class DeltaBytes:
     bytes: bytes
     decoded_at: int
     decoding_routine: int
+    position: int
 
 
-def extract_delta_bytes(delta: Delta, decoded_at_va: int, source_fva: int = 0x0) -> List[DeltaBytes]:
+def extract_delta_bytes(
+    delta: Delta, decoded_at_va: int, arguments: List[int], source_fva: int = 0x0
+) -> List[DeltaBytes]:
     """
     Extract the sequence of byte sequences that differ from before
      and after snapshots.
@@ -242,6 +273,7 @@ def extract_delta_bytes(delta: Delta, decoded_at_va: int, source_fva: int = 0x0)
     :param delta: The before and after snapshots of memory to diff.
     :param decoded_at_va: The virtual address of a specific call to
     the decoding function candidate that resulted in a memory diff
+    :param arguments: A list of arguments after the decoding function runs
     :param source_fva: function VA of the decoding routine candidate
     """
     delta_bytes = []
@@ -263,12 +295,17 @@ def extract_delta_bytes(delta: Delta, decoded_at_va: int, source_fva: int = 0x0)
     # iterate memory from after the decoding, since if somethings been allocated,
     # we want to know. don't care if things have been deallocated.
     for section_after_start, section_after in mem_after.items():
+        position = -1
         (_, _, (_, after_len, _, _), bytes_after) = section_after
         if section_after_start not in mem_before:
             location_type = AddressType.HEAP
+
+            if section_after_start in arguments:
+                position = arguments.index(section_after_start)
+
             if not is_all_zeros(bytes_after):
                 delta_bytes.append(
-                    DeltaBytes(section_after_start, location_type, bytes_after, decoded_at_va, source_fva)
+                    DeltaBytes(section_after_start, location_type, bytes_after, decoded_at_va, source_fva, position)
                 )
             continue
 
@@ -291,7 +328,10 @@ def extract_delta_bytes(delta: Delta, decoded_at_va: int, source_fva: int = 0x0)
             else:
                 location_type = AddressType.STACK
 
+            if address in arguments:
+                position = arguments.index(address)
+
             if not is_all_zeros(diff_bytes):
-                delta_bytes.append(DeltaBytes(address, location_type, diff_bytes, decoded_at_va, source_fva))
+                delta_bytes.append(DeltaBytes(address, location_type, diff_bytes, decoded_at_va, source_fva, position))
 
     return delta_bytes

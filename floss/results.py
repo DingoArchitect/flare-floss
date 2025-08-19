@@ -17,7 +17,7 @@ import re
 import json
 import datetime
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathlib import Path
 from dataclasses import field
 
@@ -122,6 +122,7 @@ class DecodedString:
         encoding: the string encoding, like ASCII or unicode
         decoded_at: the address at which the decoding routine is called
         decoding_routine: the address of the decoding routine
+        decoded_position: the position of the string pointer in the arguments to the decoding routine
     """
 
     address: int
@@ -130,6 +131,7 @@ class DecodedString:
     encoding: StringEncoding
     decoded_at: int
     decoding_routine: int
+    decoded_position: int = -1
 
 
 @dataclass(frozen=True)
